@@ -87,6 +87,9 @@
 
 extern STATE_FILE StateFile;
 
+#define OPEN_ATTEMPTS 100
+#define OPEN_SLEEP_INTERVAL 100
+
 //
 //
 //  F U N C T I O N   P R O T O T Y P E S
@@ -107,17 +110,66 @@ sf_FIST_delay_on_write();
 
 
 extern int
+is_drbd_device(
+      const char *path)
+{
+    static const int drbd_major = 147;
+
+    struct stat stats;
+    if (stat(path, &stats) == -1)
+    {
+        log_internal(MTC_LOG_ERR, "SF: failed to execute stat (sys %d).\n", errno);
+        return 0;
+    }
+    return S_ISBLK(stats.st_mode) && major(stats.st_rdev) == drbd_major;
+}
+
+static int
+retry_open(
+  int is_drbd)
+{
+  return (errno == EROFS && is_drbd) || errno == EAGAIN;
+}
+
+extern int
 sf_open(
     char *path)
 {
-    return open(path, (O_RDWR | O_DIRECT));
+    int fd = open(path, (O_RDWR | O_DIRECT));
+    if (fd >= 0)
+    {
+      return fd;
+    }
+
+    const int is_drbd = is_drbd_device(path);
+    if (retry_open(is_drbd))
+    {
+        int attempt;
+        for (attempt = 0; attempt < OPEN_ATTEMPTS; ++attempt)
+        {
+            log_internal(MTC_LOG_WARNING, "SF: failed to open the DRBD State-File %s (sys %d)... Retry: %d\n", path, errno, attempt);
+
+            fd = open(path, (O_RDWR | O_DIRECT));
+            if (fd < 0 && retry_open(is_drbd))
+            {
+                sf_sleep(OPEN_SLEEP_INTERVAL);
+            }
+            else
+            {
+                break;
+            }
+        }
+    }
+    return fd;
 }
 
 extern int
 sf_close(
     int desc)
 {
-    return close(desc);
+    if (desc >= 0)
+        return close(desc);
+    return 0;
 }
 
 extern MTC_STATUS
@@ -134,6 +186,9 @@ sf_read(
 
     if (lseek(desc, offset, SEEK_SET) < 0)
     {
+        log_internal(MTC_LOG_ERR,
+                     "SF: failed to seek (off=%jd) in State-File %s (fd %d) during read. (sys %d)\n",
+                     (intmax_t)offset, _sf_path, desc, errno);
         return MTC_ERROR_SF_IO_ERROR;
     }
 
@@ -147,6 +202,8 @@ sf_read(
         n = read(desc, buffer, length);
         if (n < 0)
         {
+            log_internal(MTC_LOG_ERR,
+                         "SF: failed to read in State-File %s (fd %d). (sys %d)\n", _sf_path, desc, errno);
             return MTC_ERROR_SF_IO_ERROR;
         }
         length -= n;
@@ -173,6 +230,9 @@ sf_write(
 
     if (lseek(desc, offset, SEEK_SET) < 0)
     {
+        log_internal(MTC_LOG_ERR,
+                     "SF: failed to seek (off=%jd) in State-File %s (fd %d) during write. (sys %d)\n",
+                     (intmax_t)offset, _sf_path, desc, errno);
         return MTC_ERROR_SF_IO_ERROR;
     }
 
@@ -184,6 +244,8 @@ sf_write(
 
     if (write(desc, buffer, length) < 0)
     {
+        log_internal(MTC_LOG_ERR,
+                     "SF: failed to write in State-File %s (fd %d). (sys %d)\n", _sf_path, desc, errno);
         return MTC_ERROR_SF_IO_ERROR;
     }
 
